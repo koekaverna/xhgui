@@ -1,118 +1,94 @@
-# This dockerfile is optimized to have efficient layers caching.
-# for example composer install is ran only if composer related files are updated.
-# also modifying source, would not need to rebuild extensions layer.
-# Author: Elan Ruusamäe <glen@pld-linux.org>
+# syntax=docker/dockerfile:experimental
 
-# build (build from source), prebuilt (use copy from last release image)
-ARG BUILD_SOURCE=build
+#####################
+### Scratch image ###
+#####################
+FROM php:8.2.12-fpm-alpine3.18 AS scratch
 
-FROM alpine:3.15 AS alpine
-
-FROM alpine AS base
-ENV PHP_INI_DIR /etc/php7
-
-# php-fpm runtime
-FROM base AS php-build
 RUN set -x \
-	&& apk add --no-cache \
-		nginx \
-		php-cli \
-		php-ctype \
-		php-fpm \
-		php-json \
-		php-pdo \
-		php-pdo_mysql \
-		php-pdo_pgsql \
-		php-pdo_sqlite \
-		php-phar \
-		php-session \
-		php-simplexml \
-		php7-pecl-mongodb \
-	# Use www-data uid from alpine also present in docker php images
-	&& adduser -u 82 -D -S -G www-data www-data \
-	# Tweak php-fpm config
-	&& sed -i \
-		-e "s#^;daemonize\s*=\s*yes#daemonize = no#" \
-		-e "s#^;error_log\s*=.*#error_log = /var/log/php/fpm.error.log#" \
-		$PHP_INI_DIR/php-fpm.conf \
-	&& POOL_CONFIG=$PHP_INI_DIR/php-fpm.d/www.conf \
-	&& sed -i \
-		-e "s#^listen\s*=.*#listen = [::]:9000#" \
-		-e "s#^listen\.allowed_clients\s*=.*#;&#" \
-		-e "s#^;access\.log\s*=.*#access.log = /var/log/php/fpm.access.log#" \
-		-e "s#^;clear_env\s*=.*#clear_env = no#" \
-		-e "s#^user = nobody\s*#user = www-data#" \
-		-e "s#^group = nobody\s*#group = www-data#" \
-		-e "s#^;catch_workers_output\s*=.*#catch_workers_output = yes#" \
-		$POOL_CONFIG \
-	&& rm -rf /var/log/php7 \
-	&& ln -s php /var/log/php7 \
-	&& install -d -o www-data -g www-data /var/log/php \
-	&& ln -s php-fpm7 /usr/sbin/php-fpm \
-	&& ln -s /dev/stderr /var/log/php/fpm.access.log \
-	&& ln -s /dev/stderr /var/log/php/fpm.error.log \
-	&& ln -s /dev/stdout /var/log/nginx/access.log \
-	&& ln -s /dev/stderr /var/log/nginx/error.log \
-	&& php -m
+    && apk add --no-cache --virtual .build-deps icu-dev \
+    && docker-php-ext-install -j$(nproc) intl \
+    && apk add --no-cache icu-libs \
+    && apk del .build-deps
 
-FROM xhgui/xhgui:latest AS php-prebuilt
-# "php" alias
-FROM php-$BUILD_SOURCE AS php
+RUN docker-php-ext-install -j$(nproc) pcntl
 
-# prepare sources
-FROM alpine AS source
-WORKDIR /app
-COPY . .
-# mkdir "vendor" dir, so the next stage can optionally use external vendor dir contents
-WORKDIR /app/vendor
-RUN chmod -R a+rX /app
+ENV MONGODB_VERSION 1.16.2
+RUN set -x \
+    && apk add --no-cache --virtual .build-deps openssl-dev \
+    && mkdir -p /usr/src/php/ext/mongodb \
+    && curl "https://pecl.php.net/get/mongodb/${MONGODB_VERSION}" \
+        | tar xvz --directory=/usr/src/php/ext/mongodb --strip=1 \
+    && docker-php-ext-install -j$(nproc) mongodb \
+    && rm -rf /usr/src/php/ext/mongodb \
+    && apk del .build-deps
 
-# install composer vendor
-FROM php AS build
-WORKDIR /app
-ARG COMPOSER_FLAGS="--no-interaction --no-suggest --ansi --no-dev"
-COPY --from=composer:1.10 /usr/bin/composer /usr/bin/
+WORKDIR /var/www/html
 
-COPY --from=source /app/composer.* ./
-COPY --from=source /app/vendor ./vendor
+######################
+### Composer image ###
+######################
+FROM scratch AS composer
 
-# install in two steps to cache composer run based on composer.* files
-RUN composer install $COMPOSER_FLAGS --no-scripts --no-autoloader
+# Setup Composer authentetication (https://getcomposer.org/doc/03-cli.md#composer-auth)
+ARG COMPOSER_AUTH
 
-# copy rest of the project. copy in order that is least to most changed
-COPY --from=source /app/webroot ./webroot
-COPY --from=source /app/external ./external
-COPY --from=source /app/templates ./templates
-COPY --from=source /app/src ./src
-COPY --from=source /app/config ./config
+ENV COMPOSER_VERSION 2.6.5
+RUN set -x \
+    && curl --silent --show-error --location --retry 5 https://getcomposer.org/installer --output /tmp/installer.php \
+    && php /tmp/installer.php --install-dir=/usr/local/bin --filename=composer --version=${COMPOSER_VERSION} \
+    && rm -f /tmp/installer.php
 
-# second run to invoke (possible) scripts and create autoloader
-RUN composer install $COMPOSER_FLAGS --classmap-authoritative
-# not needed runtime, cleanup
-RUN rm -vf composer.* vendor/composer/*.json
+CMD ["composer"]
 
-# add vendor as separate docker layer
-RUN mv vendor /
+########################
+### Production image ###
+########################
+FROM scratch AS production
 
-RUN install -d /cache -m 700
+RUN cp ${PHP_INI_DIR}/php.ini-production ${PHP_INI_DIR}/php.ini
 
-# runtime image from current build
-FROM php AS runtime-build
+# https://symfony.com/doc/current/performance.html#configure-the-php-realpath-cache
+RUN echo realpath_cache_size=4096K >> ${PHP_INI_DIR}/conf.d/php.ini \
+    && echo realpath_cache_ttl=600 >> ${PHP_INI_DIR}/conf.d/php.ini
 
-ARG APPDIR=/var/www/xhgui
-ARG WEBROOT=$APPDIR/webroot
-WORKDIR $APPDIR
+#################
+### App image ###
+#################
+FROM composer as composer_dependencies
+COPY . /var/www/html
+RUN --mount=type=cache,target=/root/.composer/cache composer install --no-dev --classmap-authoritative --no-scripts --no-progress
 
-EXPOSE 80
-CMD ["sh", "-c", "nginx && exec php-fpm"]
-VOLUME "/run/nginx"
+FROM production as app
 
-# runtime image from last release
-FROM xhgui/xhgui:latest AS runtime-prebuilt
-RUN rm -rf $(pwd)
+COPY --from=composer_dependencies /var/www/html/vendor /var/www/html/vendor
+COPY --from=composer_dependencies /var/www/html/webroot ./webroot
+COPY --from=composer_dependencies /var/www/html/external ./external
+COPY --from=composer_dependencies /var/www/html/templates ./templates
+COPY --from=composer_dependencies /var/www/html/src ./src
+COPY --from=composer_dependencies /var/www/html/config ./config
 
-# build final image
-FROM runtime-$BUILD_SOURCE AS runtime
-COPY --from=build /vendor ./vendor/
-COPY --from=build /app ./
-COPY --from=build --chown=www-data /cache ./cache/
+###################
+### Nginx image ###
+###################
+FROM nginx:1.25.3-alpine AS nginx
+
+RUN rm /etc/nginx/conf.d/default.conf
+
+COPY config/nginx.conf /etc/nginx/conf.d/default.conf
+# COPY devops/docker/nginx/templates/status.conf.template /etc/nginx/templates/
+
+RUN sed -i 's/worker_processes  1/worker_processes  auto/g' /etc/nginx/nginx.conf \
+    && sed -i 's/worker_connections  1024/worker_connections  4096;\n    multi_accept on/g' /etc/nginx/nginx.conf \
+    && sed -i 's/#tcp_nopush     on/tcp_nopush      on;\n    tcp_nodelay     on;\n    server_tokens   off/g' /etc/nginx/nginx.conf \
+    && sed -i 's/#gzip  on/gzip on;\n    gzip_disable  "msie6";\n    gzip_types text\/plain text\/css application\/json text\/javascript application\/javascript text\/xml application\/xml image\/svg+xml/g' /etc/nginx/nginx.conf
+
+RUN sed -i '/default_type/a \\n    map $http_x_request_id $proxied_request_id {\n        default   $http_x_request_id;\n        ""        $request_id;\n    }' /etc/nginx/nginx.conf \
+    && sed -i 's/"$http_x_forwarded_for"/"$http_x_forwarded_for" $proxied_request_id/g' /etc/nginx/nginx.conf \
+    && echo "fastcgi_param  HTTP_REQUEST_ID    \$proxied_request_id;" >> /etc/nginx/fastcgi_params
+
+ENV SERVER_NAME localhost
+ENV FASTCGI_HOST php
+ENV FASTCGI_PORT 9000
+
+COPY ./webroot /var/www/html/webroot

@@ -1,18 +1,26 @@
 version: "3.7"
 
 services:
-  xhgui:
-    # https://hub.docker.com/r/xhgui/xhgui/tags
-    image: xhgui/xhgui:latest
+  http:
+    build:
+      context: .
+      target: nginx
     restart: always
     volumes:
-      - ./config:/var/www/xhgui/config
-      - ./nginx.conf:/etc/nginx/http.d/default.conf:ro
+      - .:/var/www/html
+    depends_on:
+      - app
+    ports:
+      - "8142:80"
+
+  app:
+    build:
+      context: .
+      target: app
+    restart: always
     environment:
       - XHGUI_MONGO_HOSTNAME=mongo
       - XHGUI_MONGO_DATABASE=xhprof
-    ports:
-      - "8142:80"
 
   mongo:
     image: percona/percona-server-mongodb:3.6
